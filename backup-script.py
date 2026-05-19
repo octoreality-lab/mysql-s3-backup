@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -41,6 +42,7 @@ REQUIRED_KEYS = [
     "BACKUP_RETENTION_DAYS",
     "LOG_FILE",
     "S3_PREFIX",
+    "MIN_TMP_SPACE_MB",
 ]
 
 
@@ -69,6 +71,57 @@ def require_env() -> dict[str, str]:
         )
         raise SystemExit(2)
     return {k: getenv_strip(k) or "" for k in REQUIRED_KEYS}
+
+
+def parse_min_tmp_space_mb(raw: str) -> int:
+    try:
+        mb = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"MIN_TMP_SPACE_MB must be a non-negative integer, got {raw!r}") from exc
+    if mb < 0:
+        raise ValueError("MIN_TMP_SPACE_MB must be >= 0")
+    return mb
+
+
+def assert_tmp_disk_space(temp_root: Path, min_mb: int) -> None:
+    """Require at least min_mb mebibytes free on the filesystem hosting temp_root."""
+    try:
+        usage = shutil.disk_usage(temp_root)
+    except OSError as exc:
+        logging.error(
+            "Could not read disk usage for temporary directory %s: %s",
+            temp_root,
+            exc,
+        )
+        raise RuntimeError("Disk space check failed") from exc
+
+    free_bytes = usage.free
+    free_mb = free_bytes / (1024 * 1024)
+    total_bytes = usage.total
+    total_mb = total_bytes / (1024 * 1024)
+    used_bytes = usage.used
+    used_mb = used_bytes / (1024 * 1024)
+
+    logging.info(
+        "Disk space for %s: %.2f MiB free of %.2f MiB total (%.2f MiB used); "
+        "MIN_TMP_SPACE_MB=%s",
+        temp_root,
+        free_mb,
+        total_mb,
+        used_mb,
+        min_mb,
+    )
+
+    required_bytes = min_mb * 1024 * 1024
+    if free_bytes < required_bytes:
+        logging.error(
+            "Insufficient disk space on %s: %.2f MiB free, need at least %s MiB "
+            "(MIN_TMP_SPACE_MB)",
+            temp_root,
+            free_mb,
+            min_mb,
+        )
+        raise RuntimeError("Insufficient temporary disk space for backup")
 
 
 def setup_logging(log_path: Path) -> None:
@@ -251,6 +304,9 @@ def main() -> int:
     object_key = f"{prefix}{zip_path.name}"
 
     try:
+        min_tmp_mb = parse_min_tmp_space_mb(env["MIN_TMP_SPACE_MB"])
+        assert_tmp_disk_space(temp_root, min_tmp_mb)
+
         mysqldump_sql(env, sql_path)
         sql_size = sql_path.stat().st_size
         logging.info("Dump written: %s (size: %s bytes)", sql_path, sql_size)

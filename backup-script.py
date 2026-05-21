@@ -342,14 +342,19 @@ def send_backup_email(
     missing = [k for k in EMAIL_ENV_KEYS if not getenv_strip(k)]
     if missing:
         logging.error(
-            "EMAIL_TO is set but missing email variables: %s; skipping email",
+            "Email report status: not sent — missing variables %s (recipient: %s)",
             ", ".join(missing),
+            to_raw,
         )
         return
 
     recipients = _parse_email_recipients(to_raw)
+    recipients_display = ", ".join(recipients)
     if not recipients:
-        logging.error("EMAIL_TO is empty after parsing; skipping email")
+        logging.error(
+            "Email report status: not sent — invalid EMAIL_TO (recipient: %s)",
+            to_raw,
+        )
         return
 
     smtp_host = getenv_strip("SMTP_HOST") or ""
@@ -390,7 +395,6 @@ def send_backup_email(
         )
     )
 
-    logging.info("Sending backup report email to %s", msg["To"])
     try:
         with smtplib.SMTP(smtp_host, smtp_port, timeout=60) as smtp:
             if _smtp_use_tls(smtp_port):
@@ -399,10 +403,17 @@ def send_backup_email(
                 smtp.login(smtp_user, smtp_password)
             smtp.sendmail(from_addr, recipients, msg.as_string())
     except (OSError, smtplib.SMTPException) as exc:
-        logging.error("Failed to send backup report email: %s", exc)
+        logging.error(
+            "Email report status: failed — could not send to %s: %s",
+            recipients_display,
+            exc,
+        )
         raise
 
-    logging.info("Backup report email sent")
+    logging.info(
+        "Email report status: sent — delivered to %s",
+        recipients_display,
+    )
 
 
 def main() -> int:
@@ -460,7 +471,7 @@ def main() -> int:
             try:
                 send_backup_email(env, log_file, exit_code == 0)
             except Exception:
-                logging.exception("Backup report email failed")
+                pass  # send status already logged to backup.log
 
     return exit_code
 

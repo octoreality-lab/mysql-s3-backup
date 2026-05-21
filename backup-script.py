@@ -136,17 +136,53 @@ def assert_tmp_disk_space(temp_root: Path, min_mb: int) -> None:
         raise RuntimeError("Insufficient temporary disk space for backup")
 
 
-def setup_logging(log_path: Path) -> None:
+class RunLogHandler(logging.Handler):
+    """Buffers formatted log lines for the current script execution (email body)."""
+
+    def __init__(self, formatter: logging.Formatter) -> None:
+        super().__init__()
+        self.setFormatter(formatter)
+        self._lines: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self._lines.append(self.format(record))
+        except Exception:
+            self.handleError(record)
+
+    def get_text(self, max_bytes: int = MAX_LOG_EMAIL_BYTES) -> tuple[str, bool]:
+        text = "\n".join(self._lines)
+        if not text:
+            return "(no log output for this run)", False
+        encoded = text.encode("utf-8")
+        if len(encoded) <= max_bytes:
+            return text, False
+        tail = encoded[-max_bytes:].decode("utf-8", errors="replace")
+        return (
+            f"... (log truncated, showing last {max_bytes} bytes)\n\n{tail}",
+            True,
+        )
+
+
+def setup_logging(log_path: Path) -> RunLogHandler:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(message)s",
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[
-            logging.FileHandler(log_path, encoding="utf-8"),
-            logging.StreamHandler(sys.stdout),
-        ],
     )
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    run_handler = RunLogHandler(formatter)
+
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.setLevel(logging.INFO)
+    root.addHandler(file_handler)
+    root.addHandler(stream_handler)
+    root.addHandler(run_handler)
+    return run_handler
 
 
 def mysqldump_sql(
@@ -313,18 +349,6 @@ def _smtp_use_tls(port: int) -> bool:
     return raw.lower() in ("1", "true", "yes", "on")
 
 
-def _read_log_for_email(log_path: Path) -> tuple[str, bool]:
-    """Return log text and whether it was truncated."""
-    if not log_path.exists():
-        return "(log file not found)", False
-    data = log_path.read_bytes()
-    if len(data) <= MAX_LOG_EMAIL_BYTES:
-        return data.decode("utf-8", errors="replace"), False
-    tail = data[-MAX_LOG_EMAIL_BYTES :]
-    text = tail.decode("utf-8", errors="replace")
-    return f"... (log truncated, showing last {MAX_LOG_EMAIL_BYTES} bytes)\n\n{text}", True
-
-
 def _flush_log_handlers() -> None:
     for handler in logging.root.handlers:
         handler.flush()
@@ -332,7 +356,7 @@ def _flush_log_handlers() -> None:
 
 def send_backup_email(
     env: dict[str, str],
-    log_path: Path,
+    run_log: RunLogHandler,
     success: bool,
 ) -> None:
     to_raw = getenv_strip("EMAIL_TO")
@@ -364,7 +388,7 @@ def send_backup_email(
     smtp_password = getenv_strip("SMTP_PASSWORD")
 
     _flush_log_handlers()
-    log_text, truncated = _read_log_for_email(log_path)
+    log_text, truncated = run_log.get_text()
 
     status = "SUCCESS" if success else "FAILED"
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -378,7 +402,7 @@ def send_backup_email(
     ]
     if truncated:
         summary_lines.append(
-            f"Log excerpt attached (file exceeded {MAX_LOG_EMAIL_BYTES} bytes)."
+            f"Run log truncated in email (exceeded {MAX_LOG_EMAIL_BYTES} bytes)."
         )
     summary = "\n".join(summary_lines)
 
@@ -389,7 +413,7 @@ def send_backup_email(
     msg.attach(MIMEText(summary, "plain", "utf-8"))
     msg.attach(
         MIMEText(
-            f"--- {log_path.name} ---\n\n{log_text}",
+            f"--- current run log ---\n\n{log_text}",
             "plain",
             "utf-8",
         )
@@ -424,7 +448,7 @@ def main() -> int:
     if not log_file.is_absolute():
         log_file = script_dir() / log_file
 
-    setup_logging(log_file)
+    run_log = setup_logging(log_file)
     temp_root = Path(getenv_strip("TEMP_DIR") or tempfile.gettempdir())
     temp_root.mkdir(parents=True, exist_ok=True)
 
@@ -469,7 +493,7 @@ def main() -> int:
 
         if getenv_strip("EMAIL_TO"):
             try:
-                send_backup_email(env, log_file, exit_code == 0)
+                send_backup_email(env, run_log, exit_code == 0)
             except Exception:
                 pass  # send status already logged to backup.log
 

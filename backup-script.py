@@ -9,10 +9,13 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import smtplib
 import subprocess
 import sys
 import tempfile
 import zipfile
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -44,6 +47,15 @@ REQUIRED_KEYS = [
     "S3_PREFIX",
     "MIN_TMP_SPACE_MB",
 ]
+
+EMAIL_ENV_KEYS = [
+    "EMAIL_TO",
+    "SMTP_HOST",
+    "SMTP_PORT",
+    "EMAIL_FROM",
+]
+
+MAX_LOG_EMAIL_BYTES = 512 * 1024
 
 
 def script_dir() -> Path:
@@ -280,6 +292,119 @@ def apply_retention(env: dict[str, str]) -> None:
     logging.info("Retention cleanup done; removed %s object(s)", deleted)
 
 
+def _parse_email_recipients(raw: str) -> list[str]:
+    return [addr.strip() for addr in raw.replace(";", ",").split(",") if addr.strip()]
+
+
+def _parse_smtp_port(raw: str) -> int:
+    try:
+        port = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"SMTP_PORT must be an integer, got {raw!r}") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError(f"SMTP_PORT must be between 1 and 65535, got {port}")
+    return port
+
+
+def _smtp_use_tls(port: int) -> bool:
+    raw = getenv_strip("SMTP_USE_TLS")
+    if raw is None:
+        return port == 587
+    return raw.lower() in ("1", "true", "yes", "on")
+
+
+def _read_log_for_email(log_path: Path) -> tuple[str, bool]:
+    """Return log text and whether it was truncated."""
+    if not log_path.exists():
+        return "(log file not found)", False
+    data = log_path.read_bytes()
+    if len(data) <= MAX_LOG_EMAIL_BYTES:
+        return data.decode("utf-8", errors="replace"), False
+    tail = data[-MAX_LOG_EMAIL_BYTES :]
+    text = tail.decode("utf-8", errors="replace")
+    return f"... (log truncated, showing last {MAX_LOG_EMAIL_BYTES} bytes)\n\n{text}", True
+
+
+def _flush_log_handlers() -> None:
+    for handler in logging.root.handlers:
+        handler.flush()
+
+
+def send_backup_email(
+    env: dict[str, str],
+    log_path: Path,
+    success: bool,
+) -> None:
+    to_raw = getenv_strip("EMAIL_TO")
+    if not to_raw:
+        return
+
+    missing = [k for k in EMAIL_ENV_KEYS if not getenv_strip(k)]
+    if missing:
+        logging.error(
+            "EMAIL_TO is set but missing email variables: %s; skipping email",
+            ", ".join(missing),
+        )
+        return
+
+    recipients = _parse_email_recipients(to_raw)
+    if not recipients:
+        logging.error("EMAIL_TO is empty after parsing; skipping email")
+        return
+
+    smtp_host = getenv_strip("SMTP_HOST") or ""
+    smtp_port = _parse_smtp_port(getenv_strip("SMTP_PORT") or "")
+    from_addr = getenv_strip("EMAIL_FROM") or ""
+    smtp_user = getenv_strip("SMTP_USER")
+    smtp_password = getenv_strip("SMTP_PASSWORD")
+
+    _flush_log_handlers()
+    log_text, truncated = _read_log_for_email(log_path)
+
+    status = "SUCCESS" if success else "FAILED"
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    subject = f"[MySQL backup] {env['DB_NAME']} - {status} ({stamp})"
+
+    summary_lines = [
+        f"Database backup {status.lower()}.",
+        f"Database: {env['DB_NAME']}",
+        f"Host: {env['DB_HOST']}",
+        f"Time: {stamp}",
+    ]
+    if truncated:
+        summary_lines.append(
+            f"Log excerpt attached (file exceeded {MAX_LOG_EMAIL_BYTES} bytes)."
+        )
+    summary = "\n".join(summary_lines)
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = from_addr
+    msg["To"] = ", ".join(recipients)
+    msg.attach(MIMEText(summary, "plain", "utf-8"))
+    msg.attach(
+        MIMEText(
+            f"--- {log_path.name} ---\n\n{log_text}",
+            "plain",
+            "utf-8",
+        )
+    )
+
+    logging.info("Sending backup report email to %s", msg["To"])
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=60) as smtp:
+            if _smtp_use_tls(smtp_port):
+                smtp.starttls()
+            if smtp_user and smtp_password:
+                smtp.login(smtp_user, smtp_password)
+            smtp.sendmail(from_addr, recipients, msg.as_string())
+    except (OSError, smtplib.SMTPException) as exc:
+        logging.error("Failed to send backup report email: %s", exc)
+        raise
+
+    logging.info("Backup report email sent")
+
+
 def main() -> int:
     load_env()
     env = require_env()
@@ -303,6 +428,7 @@ def main() -> int:
         prefix += "/"
     object_key = f"{prefix}{zip_path.name}"
 
+    exit_code = 0
     try:
         min_tmp_mb = parse_min_tmp_space_mb(env["MIN_TMP_SPACE_MB"])
         assert_tmp_disk_space(temp_root, min_tmp_mb)
@@ -318,10 +444,9 @@ def main() -> int:
         upload_zip(env, zip_path, object_key)
         apply_retention(env)
         logging.info("Backup completed successfully")
-        return 0
     except Exception:
         logging.exception("Backup failed")
-        return 1
+        exit_code = 1
     finally:
         for p in (sql_path, zip_path):
             try:
@@ -330,6 +455,14 @@ def main() -> int:
                     logging.info("Removed temporary file: %s", p)
             except OSError as exc:
                 logging.warning("Could not remove temporary file %s: %s", p, exc)
+
+        if getenv_strip("EMAIL_TO"):
+            try:
+                send_backup_email(env, log_file, exit_code == 0)
+            except Exception:
+                logging.exception("Backup report email failed")
+
+    return exit_code
 
 
 if __name__ == "__main__":
